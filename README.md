@@ -10,7 +10,7 @@ On the raspberry you open a terminal window and type following commands:
 * `sudo apt-get update`
 * `sudo apt-get install gcc make git`
 * `git clone https://github.com/tom-2015/imgclone.git`
-* `cd imageclone`
+* `cd imgclone`
 * `make`
 * `sudo make install`
 
@@ -20,11 +20,14 @@ Attach external storage device (USB, Hard disk or mount a Samba share). cd to th
 Start backup:
 * `imgclone -d mybackup.img`
 
+To compress the image AFTER it is made use the -gzip or -bzip2 arguments.
+Show copy progress with the -p argument.
+
 # backup to network drive
 Make sure you have a NAS or other Samba shared drive in your network, then just mount it:
 * `mkdir /tmp/backup`
 * `sudo mount -t cifs //<share_drive_ip>/<share_folder_name> /tmp/backup`
-* imgclone -d /tmp/backup/mybackup.img
+* `imgclone -d /tmp/backup/mybackup.img`
 
 # restore backup
 You can use standard procedure (dd or win32diskimager) to write the .img file to a (new) SD card.

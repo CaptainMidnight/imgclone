@@ -36,6 +36,8 @@ https://github.com/tom-2015/imgclone.git
 #include <ctype.h>
 #include <dirent.h>
 #include <stdarg.h>
+#include <pthread.h>
+#include <unistd.h>
 
 /*---------------------------------------------------------------------------*/
 /* Variable and macro definitions */
@@ -55,21 +57,29 @@ typedef struct
     char flags[10];
 } partition_t;
 
+typedef struct
+{
+	char * src;
+	char * dst;
+} copy_args;
+
 partition_t parts[MAXPART];
+
+volatile char copying=0;
 
 /*---------------------------------------------------------------------------*/
 /* System helpers */
 
 /* Call a system command and read the first string returned */
 
-static int get_string (char *cmd, char *name)
+static int get_string2 (char *cmd, char *name, int print_cmd_line)
 {
     FILE *fp;
     char buf[64];
     int res;
 
     name[0] = 0;
-	printf("%s\n", cmd);
+	if (print_cmd_line) printf("%s\n", cmd);
     fp = popen (cmd, "r");
     if (fp == NULL) return 0;
     if (fgets (buf, sizeof (buf) - 1, fp) == NULL)
@@ -85,6 +95,13 @@ static int get_string (char *cmd, char *name)
         return 1;
     }
 }
+
+static int get_string (char *cmd, char *name)
+{
+    return get_string2(cmd, name, 1);
+}
+
+
 
 /* System function with printf formatting */
 
@@ -124,7 +141,7 @@ static void escape_shell_arg(char * dst_buffer, const char * src_buffer){
 	while (*src_buffer!='\0'){
 		if (*src_buffer=='"' || *src_buffer=='\\'){
 			*dst_buffer='\\';
-			*dst_buffer++;
+			dst_buffer++;
 		}
 		*dst_buffer=*src_buffer;
 		src_buffer++;
@@ -133,16 +150,25 @@ static void escape_shell_arg(char * dst_buffer, const char * src_buffer){
 	*dst_buffer='\0';
 }
 
+void * copy_thread_func(copy_args * src_dst){
+	copying=1;
+	sys_printf ("cp -ax %s/. %s/.", src_dst->src, src_dst->dst);
+	copying=0;
+	return NULL;
+}
+
 /* clone_to_img
    This function starts clone to img file
 	@param src_dev the source device to clone
 	@param dst_file the destination disk file to clone to (.IMG)
 	@param new_uuid if 1, new uuid will be generated for destination
 	@param extra_space add extra free space to the image file for future expansion
+	@param show_progress if 1 will show copy progress
+	@param compress if 1 will run bzip2 command to compress image when finished, 2 will run gzip to compress
 */
-int clone_to_img (char * src_dev, char * dst_file, char new_uuid, long long int extra_space)
+int clone_to_img (char * src_dev, char * dst_file, char new_uuid, long long int extra_space, char show_progress, char compress)
 {
-    char buffer[256], res[256], dev[16], uuid[64], puuid[64], npuuid[64], dst_dev[64], src_mnt[64], dst_mnt[64], dst_file_escaped[512];
+    char buffer[1024], res[256], dev[16], uuid[64], puuid[64], npuuid[64], dst_dev[64], src_mnt[64], dst_mnt[64], dst_file_escaped[512];
     int n, p, lbl, uid, puid;
     long long int srcsz, dstsz, stime, total_blocks=0, blocks_available=0, file_size_needed=0,available_free_space=0;
     double prog;
@@ -216,9 +242,7 @@ int clone_to_img (char * src_dev, char * dst_file, char new_uuid, long long int 
 	//mount last partition to get used disk space
 	if (sys_printf ("mount %s%d %s", partition_name (src_dev, dev), parts[n-1].pnum, src_mnt))
 	{
-		fprintf(stderr,"Could not mount partition ");
-		fprintf(stderr,partition_name (src_dev, dev));
-		fprintf(stderr,"\n");
+		fprintf(stderr,"Could not mount partition %s\n", partition_name (src_dev, dev));
 		return 5;
 	}
 
@@ -230,11 +254,11 @@ int clone_to_img (char * src_dev, char * dst_file, char new_uuid, long long int 
 	sscanf (res, "%lld", &blocks_available);
 	
 	long long int partition_size_used = (total_blocks - blocks_available) * 1024; //blocks used reported by df is not including all reserved space for filesystem, seems better to take the blocks available
-	printf("Used size of last partition is %lld bytes.\n", src_mnt, partition_size_used);
+	printf("Used size of last partition %s is %lld bytes.\n", src_mnt, partition_size_used);
 	
 	if (sys_printf ("umount %s", src_mnt))
 	{
-		fprintf(stderr,"Could not unmount partition.\n");
+		fputs("Could not unmount partition.\n",stderr);
 		return 6;
 	}
 	
@@ -298,9 +322,7 @@ int clone_to_img (char * src_dev, char * dst_file, char new_uuid, long long int 
     // wipe the FAT on the target
     if (sys_printf ("dd if=/dev/zero of=%s bs=512 count=1", dst_dev))
     {
-        fprintf(stderr,"Could not write to destination device ");
-		fprintf(stderr,dst_dev);
-		fprintf(stderr,"\n");
+        fprintf(stderr,"Could not write to destination device %s\n", dst_dev);
         return 7;
     }
 	
@@ -504,31 +526,56 @@ int clone_to_img (char * src_dev, char * dst_file, char new_uuid, long long int 
 			printf ("-----------------------------------------------\n");
 			printf ("----    COPYING FILES PLEASE WAIT        ------\n");
 			printf ("-----------------------------------------------\n");
-            sys_printf ("cp -ax %s/. %s/.", src_mnt, dst_mnt);
+			
+			if (show_progress){
+				long long int progress_max;
+				long long int progress_done;
+				copy_args src_dst;
+				pthread_t copy_thread;
+				
+				src_dst.src=src_mnt;
+				src_dst.dst=dst_mnt;
+				copying=1;
+				if(pthread_create(&copy_thread, NULL, (void* (*)(void*)) & copy_thread_func, &src_dst)) {
+					fprintf(stderr, "Error creating copy thread\n");
+					return 27;
+				}
+				
+				// get the size to be copied
+				/*sprintf (buffer, "du -s %s", src_mnt);
+				get_string (buffer, res);
+				sscanf (res, "%ld", &progress_max);*/
+				progress_max = srcsz;
+				if (progress_max < 50000) stime = 1;
+				else if (progress_max < 500000) stime = 5;
+				else stime = 10;
 
-            // get the size to be copied
-            /*sprintf (buffer, "du -s %s", src_mnt);
-            get_string (buffer, res);
-            sscanf (res, "%ld", &srcsz);
-            if (srcsz < 50000) stime = 1;
-            else if (srcsz < 500000) stime = 5;
-            else stime = 10;
-
-            // wait for the copy to complete, while updating the progress bar...
-            sprintf (buffer, "du -s %s", dst_mnt);
-            while (copying)
-            {
-                get_string (buffer, res);
-                sscanf (res, "%ld", &dstsz);
-                prog = dstsz;
-                prog /= srcsz;
-                gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (progress), prog);
-                sleep (stime);
-                CANCEL_CHECK;
-            }
-
-            gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (progress), 1.0);*/
-
+				// wait for the copy to complete, while updating the progress bar...
+				//sprintf (buffer, "du -s %s", dst_mnt);
+				sprintf (buffer, "df %s | tail -n 1 | tr -s \" \" \" \" | cut -d ' ' -f 3", dst_mnt);
+				sleep (5);
+				printf("0%%");
+				while (copying)
+				{
+					get_string2 (buffer, res, 0);
+					sscanf (res, "%lld", &progress_done);
+					prog = 100.0 * progress_done / progress_max;
+					if (prog > 100) prog=100;
+					printf("\r%d%%", (int)prog);
+					fflush(stdout);
+					sleep (stime);
+				}
+				printf ("\r100%%\n");
+				/* wait for the second thread to finish */
+				if(pthread_join(copy_thread, NULL)) {
+					fprintf(stderr, "Error joining thread\n");
+					return 28;
+				}
+				
+			}else{ 
+				sys_printf ("cp -ax %s/. %s/.", src_mnt, dst_mnt);
+			}
+            
             // fix up relevant files if changing partition UUID
             if (puid && new_uuid)
             {
@@ -538,16 +585,21 @@ int clone_to_img (char * src_dev, char * dst_file, char new_uuid, long long int 
             }
 
             // unmount partitions
-            if (sys_printf ("umount %s", dst_mnt))
+            int timeout=30;
+            while (sys_printf ("umount %s", dst_mnt) && timeout>0)
             {
-                fprintf(stderr,"Could not unmount partition.\n");
-                return 19;
+                sleep(10);
+                timeout--;
+                if (timeout==0){
+                    fprintf(stderr,"Could not unmount partition %s.\n", dst_mnt);
+                    return 19;
+                }
             }
 
             if (sys_printf ("umount %s", src_mnt))
             {
-                fprintf(stderr,"Could not unmount partition.\n");
-                return 20;
+                fprintf(stderr,"Warning: could not unmount partition source partition %s.\n", src_mnt);
+                //return 20;
             }
 
 			//if (sys_printf ("umount %s%d", partition_name (dst_dev, dev), parts[p].pnum)){
@@ -576,7 +628,7 @@ int clone_to_img (char * src_dev, char * dst_file, char new_uuid, long long int 
 	
 	//release the image file
 	if (sys_printf("losetup -d %s", dst_dev)){
-		fprintf(stderr,"Error releasing device %d.\n", dst_dev);
+		fprintf(stderr,"Error releasing device %s.\n", dst_dev);
 		return 24;
 	}else{
 		printf("Backup completed!\n");
@@ -585,6 +637,16 @@ int clone_to_img (char * src_dev, char * dst_file, char new_uuid, long long int 
 	//delete partitions from devices
 	for (p = 0; p < n; p++){
 		sys_printf ("rm %s%d", partition_name (dst_dev, dev), parts[p].pnum);
+	}
+	
+	if (compress==1){
+		printf("Compressing image.\n");
+		sys_printf("bzip2 -f \"%s\"", dst_file_escaped);
+	}
+
+	if (compress==2){
+		printf("Compressing image.\n");
+		sys_printf("gzip -f \"%s\"", dst_file_escaped);
 	}
 	
     return 0;
@@ -598,10 +660,12 @@ int main (int argc, char *argv[])
 	char dst_file[64];
 	char src_dev[64];
 	char new_uuid=0;
+	char show_progress=0;
+	char compress=0;
 	long long int extra_space=(long long int)512*(long long int)20480; //10MB extra space
 	int i;
 	
-	printf ("----    Raspberry Pi clone to image V1.1    ---\n");
+	printf ("----    Raspberry Pi clone to image V1.8    ---\n");
 	printf ("-----------------------------------------------\n");
 	printf ("---- DO NOT CHANGE FILES ON YOUR SD CARD    ---\n");
 	printf ("---- WHILE THE BACKUP PROGRAM IS RUNNING    ---\n");
@@ -618,15 +682,15 @@ int main (int argc, char *argv[])
 			if (i<argc){
 				stpcpy(dst_file,argv[i]);
 			}else{
-				fprintf(stderr,"Missing file name for -s.\n");
+				fprintf(stderr,"Missing file name for -d.\n");
 				return 1;
 			}
 		}else if (strcmp(argv[i], "-s")==0){
 			i++;
 			if (i<argc){
-				stpcpy(argv[i],src_dev);
+				stpcpy(src_dev,argv[i]);
 			}else{
-				fprintf(stderr,"Missing file name for -s.\n");
+				fprintf(stderr,"Missing device for -s.\n");
 				return 1;
 			}
 		}else if (strcmp(argv[i], "-u")==0){
@@ -634,9 +698,15 @@ int main (int argc, char *argv[])
 			if (i<argc){
 				if (argv[i][0]!='0') new_uuid=1;
 			}else{
-				fprintf(stderr,"Missing file name for -s.\n");
+				fprintf(stderr,"Missing argument for -u.\n");
 				return 1;
-			}			
+			}
+		}else if (strcmp(argv[i], "-bzip2")==0){
+			compress=1;
+		}else if (strcmp(argv[i], "-gzip")==0){
+			compress=2;
+		}else if (strcmp(argv[i], "-p")==0){
+			show_progress=1;
 		}else if (strcmp(argv[i], "-x")==0){
 			i++;
 			if (i<argc){
@@ -654,11 +724,12 @@ int main (int argc, char *argv[])
 			printf("	-s <source_device>     creates a backup of source_device, optional default is /dev/mmcblk0.\n");
 			printf("	-d <destination_file>  backup to destination_file.\n");
 			printf("    -x <number>            add <number> extra bytes of free space to the last partition.\n");
+			printf("    -p			           write copy progress to output.\n");
+			printf("    -bzip2  	           use bzip2 command to compress the image after cloning.\n");
+			printf("    -gzip   	           use gzip  command to compress the image after cloning.\n");
 			return 0;
 		}else{
-			fprintf(stderr,"Invalid argument ");
-			fprintf(stderr,argv[i]);
-			fprintf(stderr,"\n");
+			fprintf(stderr,"Invalid argument %s\n", argv[i]);
 			return 1;
 		}
 	}
@@ -669,8 +740,17 @@ int main (int argc, char *argv[])
 	}
 	
 
-	
 	printf("Cloning %s to %s\n", src_dev, dst_file);
-	
-	return clone_to_img(src_dev, dst_file, new_uuid, extra_space);
+	switch (compress){
+		case 1:
+			printf("bzip2 compress is on.\n");
+			break;
+		case 2:
+			printf("gzip compress in on.\n");
+			break;
+	}
+	if (show_progress){
+		printf("Show progress is on.\n");
+	}
+	return clone_to_img(src_dev, dst_file, new_uuid, extra_space, show_progress, compress);
 }
